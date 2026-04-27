@@ -54,13 +54,46 @@ def is_scanned_page(page: fitz.Page, text_threshold: int = 30) -> bool:
     return len(text) < text_threshold
 
 
+def is_garbled_text(text: str) -> bool:
+    """
+    Detect if extracted text is garbled due to custom non-Unicode font encoding.
+    PDFs with custom Gujarati/Sanskrit fonts map native glyphs to Latin char codes,
+    producing text full of extended Latin chars (0x80-0xFF) that is not real content.
+    
+    Returns True if the text appears garbled / not meaningful.
+    """
+    if not text or len(text) < 10:
+        return True
+    
+    # Count characters in extended Latin range (0x80-0xFF) — hallmark of garbled fonts
+    extended_latin = sum(1 for c in text if 0x80 <= ord(c) <= 0xFF)
+    # Count proper Unicode Gujarati (U+0A80–U+0AFF) and Devanagari (U+0900–U+097F)
+    native_indic = sum(1 for c in text if 0x0900 <= ord(c) <= 0x097F or 0x0A80 <= ord(c) <= 0x0AFF)
+    # Count standard ASCII printable
+    ascii_printable = sum(1 for c in text if 0x20 <= ord(c) <= 0x7E)
+    
+    total_chars = len(text.replace(' ', '').replace('\n', ''))
+    if total_chars == 0:
+        return True
+    
+    extended_ratio = extended_latin / total_chars
+    
+    # If more than 15% of chars are in extended Latin range (0x80-0xFF),
+    # and there are very few proper Indic Unicode chars, it's garbled
+    if extended_ratio > 0.15 and native_indic < total_chars * 0.05:
+        logger.info(f"  → Garbled text detected: {extended_ratio:.1%} extended Latin, {native_indic} Indic chars")
+        return True
+    
+    return False
+
+
 def extract_text_native(page: fitz.Page) -> str:
     """Extract native (digital) text from a PDF page."""
     return page.get_text("text").strip()
 
 
-def page_to_image(page: fitz.Page, dpi: int = 200) -> Image.Image:
-    """Render a PDF page to a PIL Image for OCR."""
+def page_to_image(page: fitz.Page, dpi: int = 300) -> Image.Image:
+    """Render a PDF page to a PIL Image for OCR. Uses 300 DPI for better accuracy."""
     mat = fitz.Matrix(dpi / 72, dpi / 72)
     pix = page.get_pixmap(matrix=mat)
     img_bytes = pix.tobytes("png")
@@ -255,14 +288,28 @@ def ingest_pdf(
         logger.info(f"Processing page {pg_label}/{total_pages} ...")
 
         scanned = is_scanned_page(page)
+        used_ocr = False
         
         if scanned:
+            # Clearly scanned: no selectable text → OCR
             logger.info(f"  Page {pg_label}: scanned → running OCR")
             img = page_to_image(page, dpi=dpi)
             raw_text = ocr_page(img)
+            used_ocr = True
         else:
-            logger.info(f"  Page {pg_label}: digital text → native extraction")
-            raw_text = extract_text_native(page)
+            # Has selectable text — but check if it's garbled
+            native_text = extract_text_native(page)
+            
+            if is_garbled_text(native_text):
+                # Garbled font encoding detected → force OCR
+                logger.info(f"  Page {pg_label}: garbled font encoding detected → forcing OCR")
+                img = page_to_image(page, dpi=dpi)
+                raw_text = ocr_page(img)
+                used_ocr = True
+                scanned = True  # Mark as effectively scanned
+            else:
+                logger.info(f"  Page {pg_label}: clean digital text → native extraction")
+                raw_text = native_text
 
         cleaned = clean_text(raw_text)
         lang = detect_language(cleaned)
@@ -275,6 +322,7 @@ def ingest_pdf(
             "raw_text": raw_text,
             "cleaned_text": cleaned,
             "structured_md": structured,
+            "used_ocr": used_ocr,
         }
         pages.append(page_data)
         full_markdown += structured + "\n"

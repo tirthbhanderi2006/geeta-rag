@@ -1,10 +1,8 @@
 """
-MODULE 3: QA / Exploration Tool
-Gradio Chat UI with:
-- File upload + ingestion trigger
-- Conversational chat interface with Groq LLM
-- RAG context display alongside LLM answers
-- Multilingual query support (English, Gujarati, Sanskrit, Hindi)
+MODULE 3: RAG Chat Interface (Streamlit)
+- Conversational chat UI with message history
+- RAG retrieval panel showing source passages
+- Multilingual support (English, Gujarati, Sanskrit, Hindi)
 - Groq LLM backend (LLaMA 3.3 70B)
 """
 
@@ -12,9 +10,9 @@ import os
 import json
 import logging
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Tuple
 from dotenv import load_dotenv
-import gradio as gr
+import streamlit as st
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -24,29 +22,35 @@ logger = logging.getLogger(__name__)
 from ingest import ingest_pdf
 from utils import build_vector_store, retrieve_chunks, keyword_search, get_chroma_collection
 
+
 # ---------------------------------------------------------------------------
 # Groq LLM backend
 # ---------------------------------------------------------------------------
 
 def build_rag_prompt(question: str, context: str) -> str:
     """Build the RAG prompt with retrieved context — multilingual aware."""
-    return f"""You are an expert multilingual assistant specialized in spiritual and philosophical texts, particularly the Bhagavad Gita.
-You understand English, Gujarati (ગુજરાતી), Sanskrit (संस्कृत), and Hindi (हिन्दी).
-
-Instructions:
-- Answer the question using ONLY the provided context passages below.
-- If the context contains text in Gujarati or Sanskrit, you may translate or explain it in the language the user asked the question in.
-- If the user asks in Gujarati, reply in Gujarati. If in English, reply in English. If in Hindi, reply in Hindi. Match the user's language.
-- If the answer is not in the context, say "I don't have enough information in the retrieved passages."
-- Be precise, detailed, and cite page numbers when possible.
-- Format your answer with clear structure using markdown (headings, bullet points, bold text).
-
-CONTEXT:
-{context}
-
-QUESTION: {question}
-
-ANSWER:"""
+    prompt = (
+        "You are an expert multilingual assistant specialized in spiritual and "
+        "philosophical texts, particularly the Bhagavad Gita (Yatharth Geeta).\n"
+        "You understand English, Gujarati, Sanskrit, and Hindi.\n\n"
+        "Instructions:\n"
+        "- Answer the question using ONLY the provided context passages below.\n"
+        "- The context is extracted via OCR from a Gujarati Bhagavad Gita commentary PDF.\n"
+        "- Some text may contain OCR artifacts or mixed scripts. Do your best to interpret the meaning.\n"
+        "- Be precise, detailed, and cite page numbers when possible.\n"
+        "- Use markdown formatting for well-structured answers.\n\n"
+        "CRITICAL LANGUAGE RULE:\n"
+        "- If the user asks in ENGLISH, answer ONLY in ENGLISH.\n"
+        "- If the user asks in GUJARATI, answer ONLY in GUJARATI script.\n"
+        "- If the user asks in HINDI, answer ONLY in HINDI (Devanagari script).\n"
+        "- If the user asks in SANSKRIT, answer in SANSKRIT or Hindi.\n"
+        "- ALWAYS match the user's language. Never mix languages.\n"
+        "- If the answer is not in the context, say you do not have enough information.\n\n"
+        f"CONTEXT:\n{context}\n\n"
+        f"QUESTION: {question}\n\n"
+        "ANSWER (in the SAME language as the question):"
+    )
+    return prompt
 
 
 def answer_with_groq(question: str, context: str, chat_history: list = None) -> str:
@@ -64,20 +68,22 @@ def answer_with_groq(question: str, context: str, chat_history: list = None) -> 
             {
                 "role": "system",
                 "content": (
-                    "You are a multilingual scholarly assistant for the Bhagavad Gita. "
-                    "You can read and respond in English, Gujarati (ગુજરાતી), Sanskrit (संस्कृत), and Hindi (हिन्दी). "
-                    "Always base your answers strictly on the provided context. "
-                    "Use markdown formatting for clear, well-structured answers. "
-                    "When the user greets you, respond warmly and let them know what you can help with."
+                    "You are a multilingual scholarly assistant for the Bhagavad Gita (Yatharth Geeta). "
+                    "You can read and respond in English, Gujarati, Sanskrit, and Hindi. "
+                    "The source document is OCR-extracted from a Gujarati PDF and may contain some OCR noise. "
+                    "CRITICAL: Always answer in the SAME language the user asks in. "
+                    "English question = English answer. "
+                    "Gujarati question = Gujarati answer in Gujarati script. "
+                    "Hindi question = Hindi answer in Devanagari script. "
+                    "Use markdown formatting for clear, well-structured answers."
                 ),
             },
         ]
 
-        # Add conversation history for context continuity (last 6 turns)
+        # Add last 6 turns of conversation for context continuity
         if chat_history:
             for msg in chat_history[-6:]:
-                if msg["role"] in ("user", "assistant"):
-                    messages.append({"role": msg["role"], "content": msg["content"]})
+                messages.append({"role": msg["role"], "content": msg["content"]})
 
         messages.append({"role": "user", "content": prompt})
 
@@ -94,65 +100,20 @@ def answer_with_groq(question: str, context: str, chat_history: list = None) -> 
 
 
 # ---------------------------------------------------------------------------
-# Core RAG logic
+# RAG retrieval
 # ---------------------------------------------------------------------------
 
-_session_state = {
-    "pages": [],
-    "ingested": False,
-    "source_name": "",
-}
-
-
-def ingest_and_index(pdf_file, progress=None) -> str:
-    """Ingest uploaded PDF and build vector store."""
-    if pdf_file is None:
-        return "❌ No file uploaded."
-
-    pdf_path = pdf_file.name if hasattr(pdf_file, "name") else str(pdf_file)
-    source_name = Path(pdf_path).stem
-
-    try:
-        logger.info("📄 Extracting text from PDF...")
-        result = ingest_pdf(pdf_path, output_dir="data")
-
-        _session_state["pages"] = result["pages"]
-        _session_state["source_name"] = source_name
-        n_pages = result["total_pages"]
-
-        logger.info("🔢 Building vector store...")
-        n_chunks = build_vector_store(result["pages"], persist_dir="chroma_db")
-
-        _session_state["ingested"] = True
-        return (
-            f"✅ Ingestion complete!\n\n"
-            f"- **Pages processed**: {n_pages}\n"
-            f"- **Chunks indexed**: {n_chunks}\n"
-            f"- **Source**: `{source_name}`\n\n"
-            f"You can now ask questions in the **💬 Chat** tab."
-        )
-    except Exception as e:
-        logger.error(f"Ingestion failed: {e}", exc_info=True)
-        return f"❌ Ingestion failed: {e}"
-
-
-def rag_retrieve(question: str, top_k: int, search_mode: str) -> Tuple[List[Dict], str]:
-    """
-    Retrieve relevant chunks from the vector store.
-    Returns (chunks_list, formatted_context_string).
-    """
-    if not _session_state["ingested"]:
-        return [], ""
-
+def rag_retrieve(question: str, top_k: int, search_mode: str, pages: list) -> Tuple[List[Dict], str]:
+    """Retrieve relevant chunks from the vector store."""
     try:
         if search_mode == "Semantic":
             chunks = retrieve_chunks(question, top_k=top_k, persist_dir="chroma_db")
         elif search_mode == "Keyword":
-            chunks = keyword_search(question, _session_state["pages"], max_results=top_k)
+            chunks = keyword_search(question, pages, max_results=top_k)
         else:
             # Hybrid
             sem_chunks = retrieve_chunks(question, top_k=top_k // 2 + 1, persist_dir="chroma_db")
-            kw_chunks = keyword_search(question, _session_state["pages"], max_results=top_k // 2 + 1)
+            kw_chunks = keyword_search(question, pages, max_results=top_k // 2 + 1)
             seen = set()
             chunks = []
             for c in sem_chunks + kw_chunks:
@@ -169,286 +130,356 @@ def rag_retrieve(question: str, top_k: int, search_mode: str) -> Tuple[List[Dict
         return [], ""
 
 
-def format_rag_sources(chunks: List[Dict]) -> str:
-    """Format retrieved RAG chunks into a readable markdown panel."""
-    if not chunks:
-        return "*No passages retrieved.*"
-
-    md = ""
-    for i, c in enumerate(chunks, 1):
-        score = c.get("score", "N/A")
-        score_str = f"{score:.4f}" if isinstance(score, (int, float)) else str(score)
-        text_preview = c["text"][:500]
-        if len(c["text"]) > 500:
-            text_preview += "..."
-
-        md += f"""**📄 [{i}] Page {c['page_num']}** — _{c['strategy']}_ — Score: `{score_str}`
-
-> {text_preview}
-
----
-
-"""
-    return md.strip()
-
-
-def load_existing_data() -> str:
+def load_existing_data():
     """Try to load pre-ingested data on startup."""
     json_files = list(Path("data").glob("*_pages.json"))
     if not json_files:
-        return "No pre-ingested data found. Upload a PDF to begin."
+        return None, None, 0
 
     latest = sorted(json_files)[-1]
     try:
         with open(latest, "r", encoding="utf-8") as f:
             pages = json.load(f)
-        _session_state["pages"] = pages
-        _session_state["ingested"] = True
-        _session_state["source_name"] = latest.stem.replace("_pages", "")
 
         collection = get_chroma_collection("chroma_db")
         n = collection.count()
-        return (
-            f"✅ Loaded existing data: `{latest.name}`\n\n"
-            f"- **Pages**: {len(pages)}\n"
-            f"- **Indexed chunks**: {n}\n\n"
-            f"Ready to answer questions!"
-        )
-    except Exception as e:
-        return f"Could not load existing data: {e}"
+        source_name = latest.stem.replace("_pages", "")
+        return pages, source_name, n
+    except Exception:
+        return None, None, 0
 
 
 # ---------------------------------------------------------------------------
-# Chat handler
+# Page config & custom CSS
 # ---------------------------------------------------------------------------
 
-def chat_respond(user_message: str, history: list, search_mode: str, top_k: int):
-    """
-    Main chat handler.
-    - Retrieves RAG context
-    - Generates Groq LLM answer
-    - Returns updated chat history + RAG sources panel
-    """
-    if not user_message.strip():
-        return history, ""
+st.set_page_config(
+    page_title="📖 Multilingual RAG Chat",
+    page_icon="📖",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-    if not _session_state["ingested"]:
-        history.append({"role": "user", "content": user_message})
-        history.append({
-            "role": "assistant",
-            "content": "⚠️ No document is loaded yet. Please go to the **📤 Upload & Ingest** tab first to upload a PDF."
-        })
-        return history, ""
+st.markdown("""
+<style>
+    /* Main container */
+    .main .block-container {
+        padding-top: 1rem;
+        padding-bottom: 1rem;
+        max-width: 100%;
+    }
 
-    # Step 1: Retrieve from RAG
-    chunks, context = rag_retrieve(user_message, int(top_k), search_mode)
+    /* Chat messages */
+    .stChatMessage {
+        border-radius: 12px;
+        margin-bottom: 0.5rem;
+    }
 
-    # Step 2: Generate answer via Groq
-    if context:
-        answer = answer_with_groq(user_message, context, chat_history=history)
+    /* Sidebar styling */
+    section[data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+        color: white;
+    }
+    section[data-testid="stSidebar"] .stMarkdown p,
+    section[data-testid="stSidebar"] .stMarkdown h1,
+    section[data-testid="stSidebar"] .stMarkdown h2,
+    section[data-testid="stSidebar"] .stMarkdown h3 {
+        color: white;
+    }
+
+    /* RAG card styling */
+    .rag-card {
+        background: #f0f4ff;
+        border-left: 4px solid #4f46e5;
+        border-radius: 8px;
+        padding: 12px 16px;
+        margin-bottom: 10px;
+        font-size: 0.9em;
+    }
+    .rag-card-header {
+        font-weight: 600;
+        color: #4f46e5;
+        margin-bottom: 6px;
+    }
+    .rag-card-text {
+        color: #374151;
+        line-height: 1.5;
+    }
+
+    /* Status badge */
+    .status-badge {
+        display: inline-block;
+        padding: 2px 10px;
+        border-radius: 20px;
+        font-size: 0.8em;
+        font-weight: 600;
+    }
+    .status-connected {
+        background: #d1fae5;
+        color: #065f46;
+    }
+    .status-error {
+        background: #fee2e2;
+        color: #991b1b;
+    }
+
+    /* Header */
+    .app-header {
+        text-align: center;
+        padding: 0.5rem 0;
+        margin-bottom: 0.5rem;
+    }
+
+    /* Hide Streamlit branding */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+</style>
+""", unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
+# Session state initialization
+# ---------------------------------------------------------------------------
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+if "pages" not in st.session_state:
+    st.session_state.pages = []
+
+if "ingested" not in st.session_state:
+    st.session_state.ingested = False
+
+if "source_name" not in st.session_state:
+    st.session_state.source_name = ""
+
+if "n_chunks" not in st.session_state:
+    st.session_state.n_chunks = 0
+
+if "last_rag_chunks" not in st.session_state:
+    st.session_state.last_rag_chunks = []
+
+# Auto-load existing data on first run
+if not st.session_state.ingested:
+    pages, source_name, n_chunks = load_existing_data()
+    if pages:
+        st.session_state.pages = pages
+        st.session_state.ingested = True
+        st.session_state.source_name = source_name
+        st.session_state.n_chunks = n_chunks
+
+
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
+
+with st.sidebar:
+    st.markdown("## 📖 RAG Chat Assistant")
+    st.markdown("*Multilingual Knowledge Exploration*")
+    st.divider()
+
+    # Status indicators
+    groq_key = os.getenv("GROQ_API_KEY")
+    if groq_key:
+        st.success("🤖 Groq API: Connected")
     else:
-        answer = "I couldn't find any relevant passages in the document for your question. Please try rephrasing or using a different search mode."
+        st.error("🤖 Groq API: Missing Key")
 
-    # Step 3: Format the RAG sources panel
-    rag_display = format_rag_sources(chunks)
-
-    # Step 4: Build the assistant response with both answer and RAG indicator
-    num_sources = len(chunks)
-    source_indicator = f"\n\n---\n*📚 Based on {num_sources} retrieved passage(s) from `{_session_state['source_name']}`*"
-
-    full_answer = answer + source_indicator
-
-    # Update history
-    history.append({"role": "user", "content": user_message})
-    history.append({"role": "assistant", "content": full_answer})
-
-    return history, rag_display
-
-
-def clear_chat():
-    """Clear chat history and RAG panel."""
-    return [], ""
-
-
-# ---------------------------------------------------------------------------
-# Gradio UI — Chat Interface
-# ---------------------------------------------------------------------------
-
-def build_ui():
-    groq_key_set = bool(os.getenv("GROQ_API_KEY"))
-    groq_badge = "✅ Connected" if groq_key_set else "❌ Missing API Key"
-
-    with gr.Blocks(
-        title="📖 Multilingual RAG Chat — Groq",
-    ) as demo:
-
-        # ── Header ──
-        gr.Markdown(f"""
-# 📖 Multilingual RAG Chat Assistant
-**Bhagavad Gita Knowledge Base** — Ask questions in **English**, **Gujarati** (ગુજરાતી), **Sanskrit** (संस्कृत), or **Hindi** (हिन्दी)
-
-| Component | Status |
-|-----------|--------|
-| 🤖 LLM | Groq — LLaMA 3.3 70B Versatile |
-| 🔌 API | {groq_badge} |
-| 📑 Document | `{_session_state.get('source_name', 'None loaded')}` |
-        """)
-
-        # ── Tab 1: Chat ──
-        with gr.Tab("💬 Chat"):
-            with gr.Row():
-                # Left: Chat area (70% width)
-                with gr.Column(scale=7):
-                    chatbot = gr.Chatbot(
-                        label="Conversation",
-                        height=520,
-                        layout="bubble",
-                        buttons=["copy", "copy_all"],
-                        placeholder="Upload a PDF in the '📤 Upload & Ingest' tab, then ask me anything about the Bhagavad Gita! 🙏\n\nYou can ask in English, ગુજરાતી, संस्कृत, or हिन्दी.",
-                    )
-                    with gr.Row():
-                        msg_input = gr.Textbox(
-                            placeholder="Type your question here... (English / ગુજરાતી / संस्कृत / हिन्दी)",
-                            label="Your Message",
-                            scale=8,
-                            lines=1,
-                            max_lines=3,
-                        )
-                        send_btn = gr.Button("📨 Send", variant="primary", scale=1)
-
-                    with gr.Row():
-                        clear_btn = gr.Button("🗑️ Clear Chat", variant="secondary", size="sm")
-                        gr.Markdown("*Powered by Groq LLaMA 3.3 70B • ChromaDB • Multilingual Embeddings*", elem_classes=["footer-text"])
-
-                # Right: RAG Sources panel (30% width)
-                with gr.Column(scale=3):
-                    gr.Markdown("### 📚 Retrieved Context (RAG)")
-                    gr.Markdown("*These are the document passages used to answer your question:*")
-                    rag_panel = gr.Markdown(
-                        value="*Ask a question to see retrieved passages here.*",
-                        label="RAG Sources",
-                    )
-                    with gr.Accordion("⚙️ Search Settings", open=False):
-                        search_mode = gr.Radio(
-                            choices=["Semantic", "Keyword", "Hybrid"],
-                            value="Semantic",
-                            label="Search Mode",
-                        )
-                        top_k = gr.Slider(
-                            minimum=1, maximum=10, value=5, step=1,
-                            label="Passages to retrieve",
-                        )
-
-            # Wire up chat events
-            msg_input.submit(
-                fn=chat_respond,
-                inputs=[msg_input, chatbot, search_mode, top_k],
-                outputs=[chatbot, rag_panel],
-            ).then(lambda: "", outputs=msg_input)
-
-            send_btn.click(
-                fn=chat_respond,
-                inputs=[msg_input, chatbot, search_mode, top_k],
-                outputs=[chatbot, rag_panel],
-            ).then(lambda: "", outputs=msg_input)
-
-            clear_btn.click(
-                fn=clear_chat,
-                outputs=[chatbot, rag_panel],
-            )
-
-            # Example questions
-            gr.Examples(
-                examples=[
-                    ["What is Dharmakshetra?"],
-                    ["Who is Duryodhana and what role does he play?"],
-                    ["ધર્મક્ષેત્ર નો અર્થ શું છે?"],
-                    ["भगवद्गीता का पहला श्लोक क्या है?"],
-                    ["What does Bhishma represent in the Gita?"],
-                    ["Explain the concept of Guna"],
-                ],
-                inputs=[msg_input],
-                label="💡 Try these questions",
-            )
-
-        # ── Tab 2: Upload & Ingest ──
-        with gr.Tab("📤 Upload & Ingest"):
-            gr.Markdown("### Upload a multilingual PDF for analysis")
-            gr.Markdown("Supports **scanned** and **digital** PDFs in English, Gujarati, and Sanskrit.")
-            with gr.Row():
-                pdf_input = gr.File(
-                    label="Upload PDF",
-                    file_types=[".pdf"],
-                    type="filepath",
-                )
-            ingest_btn = gr.Button("🚀 Ingest & Index Document", variant="primary")
-            ingest_status = gr.Markdown(value=load_existing_data())
-
-            ingest_btn.click(
-                fn=ingest_and_index,
-                inputs=[pdf_input],
-                outputs=[ingest_status],
-            )
-
-        # ── Tab 3: Document Info ──
-        with gr.Tab("📊 Document Info"):
-            gr.Markdown("### Document Statistics & Language Analysis")
-
-            def get_stats():
-                if not _session_state["ingested"]:
-                    return "No document loaded."
-                pages = _session_state["pages"]
-                collection = get_chroma_collection("chroma_db")
-                n_chunks = collection.count()
-
-                langs = {}
-                scanned = sum(1 for p in pages if p.get("scanned"))
-                for p in pages:
-                    l = p.get("language_detected", "unknown")
-                    langs[l] = langs.get(l, 0) + 1
-
-                stats = f"""
-**Source**: `{_session_state['source_name']}`
-
-| Metric | Value |
-|--------|-------|
-| Total pages | {len(pages)} |
-| Scanned pages (OCR'd) | {scanned} |
-| Digital pages | {len(pages) - scanned} |
-| Total indexed chunks | {n_chunks} |
-
-**🌐 Detected Languages per page:**
-"""
-                for lang, count in sorted(langs.items(), key=lambda x: -x[1]):
-                    stats += f"\n- `{lang}`: {count} pages"
-                return stats
-
-            stats_btn = gr.Button("🔄 Refresh Stats")
-            stats_out = gr.Markdown()
-            stats_btn.click(fn=get_stats, outputs=stats_out)
-
-    return demo
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=7861)
-    parser.add_argument("--share", action="store_true")
-    args = parser.parse_args()
-
-    if not os.getenv("GROQ_API_KEY"):
-        logger.warning("⚠️  GROQ_API_KEY not found in .env — QA will not work until you set it.")
+    if st.session_state.ingested:
+        st.success(f"📄 Document: `{st.session_state.source_name}`")
+        st.info(f"📊 Pages: {len(st.session_state.pages)} | Chunks: {st.session_state.n_chunks}")
     else:
-        logger.info("✅ GROQ_API_KEY loaded successfully.")
+        st.warning("📄 No document loaded")
 
-    demo = build_ui()
-    demo.launch(
-        server_port=args.port,
-        share=args.share,
-        inbrowser=True,
+    st.divider()
+
+    # Search settings
+    st.markdown("### ⚙️ Search Settings")
+    search_mode = st.radio(
+        "Search Mode",
+        options=["Semantic", "Keyword", "Hybrid"],
+        index=0,
+        help="Semantic uses AI embeddings, Keyword does exact matching, Hybrid combines both.",
     )
+    top_k = st.slider("Passages to retrieve", min_value=1, max_value=10, value=5)
+
+    st.divider()
+
+    # Upload section
+    st.markdown("### 📤 Upload Document")
+    uploaded_file = st.file_uploader(
+        "Upload a PDF",
+        type=["pdf"],
+        help="Supports scanned & digital PDFs in English, Gujarati, Sanskrit",
+    )
+
+    if uploaded_file and st.button("🚀 Ingest & Index", type="primary", use_container_width=True):
+        # Save uploaded file to temp location
+        temp_path = Path("data") / uploaded_file.name
+        temp_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path.write_bytes(uploaded_file.getvalue())
+
+        with st.spinner("📄 Extracting text & building index..."):
+            try:
+                result = ingest_pdf(str(temp_path), output_dir="data")
+                n_chunks = build_vector_store(result["pages"], persist_dir="chroma_db")
+
+                st.session_state.pages = result["pages"]
+                st.session_state.ingested = True
+                st.session_state.source_name = Path(uploaded_file.name).stem
+                st.session_state.n_chunks = n_chunks
+                st.session_state.messages = []  # Reset chat on new document
+                st.session_state.last_rag_chunks = []
+
+                st.success(f"✅ Ingested {result['total_pages']} pages, {n_chunks} chunks indexed!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"❌ Ingestion failed: {e}")
+
+    st.divider()
+
+    # Clear chat button
+    if st.button("🗑️ Clear Chat", use_container_width=True):
+        st.session_state.messages = []
+        st.session_state.last_rag_chunks = []
+        st.rerun()
+
+    st.divider()
+    st.markdown(
+        """
+        <div style='text-align:center; font-size:0.75em; opacity:0.7;'>
+        🤖 Groq LLaMA 3.3 70B<br>
+        🔍 ChromaDB + Multilingual Embeddings<br>
+        🌐 EN · ગુજરાતી · संस्कृत · हिन्दी
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main chat area
+# ---------------------------------------------------------------------------
+
+# Layout: chat (left) + RAG panel (right)
+chat_col, rag_col = st.columns([7, 3])
+
+with chat_col:
+    # Header
+    st.markdown("""
+    <div class="app-header">
+        <h2>💬 Chat with your Document</h2>
+        <p style="color: #6b7280; margin-top: -10px;">
+            Ask in <strong>English</strong>, <strong>ગુજરાતી</strong>, <strong>संस्कृत</strong>, or <strong>हिन्दी</strong> — I'll answer in your language
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Display chat messages
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    # Chat input
+    if prompt := st.chat_input("Ask a question about your document... (any language)"):
+        # Display user message
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        st.session_state.messages.append({"role": "user", "content": prompt})
+
+        if not st.session_state.ingested:
+            error_msg = "⚠️ No document loaded yet. Please upload a PDF using the sidebar first."
+            with st.chat_message("assistant"):
+                st.markdown(error_msg)
+            st.session_state.messages.append({"role": "assistant", "content": error_msg})
+        else:
+            # RAG retrieval
+            with st.spinner("🔍 Searching document..."):
+                chunks, context = rag_retrieve(
+                    prompt, top_k, search_mode, st.session_state.pages
+                )
+                st.session_state.last_rag_chunks = chunks
+
+            # Generate answer
+            with st.chat_message("assistant"):
+                with st.spinner("🤖 Generating answer..."):
+                    if context:
+                        answer = answer_with_groq(
+                            prompt, context,
+                            chat_history=st.session_state.messages[:-1]  # exclude current user msg
+                        )
+                    else:
+                        answer = "I couldn't find any relevant passages in the document. Try rephrasing your question or using a different search mode."
+
+                    # Add source indicator
+                    source_note = f"\n\n---\n📚 *Based on {len(chunks)} retrieved passage(s) from `{st.session_state.source_name}` | Search: {search_mode}*"
+                    full_answer = answer + source_note
+                    st.markdown(full_answer)
+
+            st.session_state.messages.append({"role": "assistant", "content": full_answer})
+            st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# RAG Sources Panel (right column)
+# ---------------------------------------------------------------------------
+
+with rag_col:
+    st.markdown("### 📚 Retrieved Passages")
+    st.caption("Source context used by the LLM to generate answers")
+    st.divider()
+
+    if st.session_state.last_rag_chunks:
+        for i, chunk in enumerate(st.session_state.last_rag_chunks, 1):
+            score = chunk.get("score", "N/A")
+            score_str = f"{score:.4f}" if isinstance(score, (int, float)) else str(score)
+            text_preview = chunk["text"][:400]
+            if len(chunk["text"]) > 400:
+                text_preview += "..."
+
+            st.markdown(
+                f"""
+                <div class="rag-card">
+                    <div class="rag-card-header">
+                        📄 [{i}] Page {chunk['page_num']} &nbsp;·&nbsp; {chunk['strategy']} &nbsp;·&nbsp; Score: {score_str}
+                    </div>
+                    <div class="rag-card-text">{text_preview}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        st.divider()
+        st.caption(f"Showing {len(st.session_state.last_rag_chunks)} passages | Mode: {search_mode}")
+    else:
+        st.markdown(
+            """
+            <div style="text-align: center; padding: 40px 20px; color: #9ca3af;">
+                <p style="font-size: 2em; margin-bottom: 10px;">🔍</p>
+                <p>Ask a question to see<br>retrieved passages here</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    # Document stats expander
+    if st.session_state.ingested:
+        with st.expander("📊 Document Stats"):
+            pages = st.session_state.pages
+            scanned = sum(1 for p in pages if p.get("scanned"))
+            langs = {}
+            for p in pages:
+                l = p.get("language_detected", "unknown")
+                langs[l] = langs.get(l, 0) + 1
+
+            st.markdown(f"**Source**: `{st.session_state.source_name}`")
+            col1, col2 = st.columns(2)
+            col1.metric("Total Pages", len(pages))
+            col2.metric("Chunks Indexed", st.session_state.n_chunks)
+            col1.metric("Scanned (OCR)", scanned)
+            col2.metric("Digital", len(pages) - scanned)
+
+            st.markdown("**Languages detected:**")
+            for lang, count in sorted(langs.items(), key=lambda x: -x[1]):
+                st.markdown(f"- `{lang}`: {count} pages")
