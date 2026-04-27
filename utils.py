@@ -24,11 +24,11 @@ COLLECTION_NAME = "rag_collection"
 # Chunking strategies
 # ---------------------------------------------------------------------------
 
-def chunk_by_structure(pages: List[Dict], max_chunk_size: int = 600) -> List[Dict]:
+def chunk_by_structure(pages: List[Dict], max_chunk_size: int = 800) -> List[Dict]:
     """
     Strategy 1: Structure-based chunking.
     Split on markdown headings (##, ###) and verse markers (>).
-    Respects page boundaries.
+    Respects page boundaries. Each chunk is prefixed with page context.
     """
     chunks = []
     chunk_id = 0
@@ -38,19 +38,21 @@ def chunk_by_structure(pages: List[Dict], max_chunk_size: int = 600) -> List[Dic
         if not text.strip():
             continue
 
+        page_prefix = f"[Page {page['page_num']}] "
+
         # Split on heading-like patterns
         sections = re.split(r"\n(?=#{1,3} |\> )", text)
         
         for section in sections:
             section = section.strip()
-            if not section:
+            if not section or len(section) < 50:
                 continue
             
             # If section is within size limit, add as-is
             if len(section) <= max_chunk_size:
                 chunks.append({
                     "chunk_id": f"struct_{chunk_id}",
-                    "text": section,
+                    "text": page_prefix + section,
                     "page_num": page["page_num"],
                     "strategy": "structure",
                     "language": page.get("language_detected", "unknown"),
@@ -60,23 +62,27 @@ def chunk_by_structure(pages: List[Dict], max_chunk_size: int = 600) -> List[Dic
                 # Sub-split long sections by sentence
                 sub_chunks = _split_by_sentences(section, max_chunk_size)
                 for sub in sub_chunks:
-                    chunks.append({
-                        "chunk_id": f"struct_{chunk_id}",
-                        "text": sub,
-                        "page_num": page["page_num"],
-                        "strategy": "structure_sub",
-                        "language": page.get("language_detected", "unknown"),
-                    })
-                    chunk_id += 1
+                    if len(sub.strip()) >= 50:
+                        chunks.append({
+                            "chunk_id": f"struct_{chunk_id}",
+                            "text": page_prefix + sub,
+                            "page_num": page["page_num"],
+                            "strategy": "structure_sub",
+                            "language": page.get("language_detected", "unknown"),
+                        })
+                        chunk_id += 1
 
     logger.info(f"Structure chunking → {len(chunks)} chunks")
     return chunks
 
 
-def chunk_recursive(pages: List[Dict], chunk_size: int = 500, overlap: int = 80) -> List[Dict]:
+def chunk_recursive(pages: List[Dict], chunk_size: int = 800, overlap: int = 200) -> List[Dict]:
     """
     Strategy 2: Recursive character-level chunking with overlap.
     Good for dense text where structure is unclear.
+    Uses larger chunks (800 chars) and generous overlap (200 chars) to preserve
+    more context per chunk and avoid losing information at boundaries.
+    Each chunk is prefixed with page context for better embedding quality.
     """
     # Combine all text with page markers
     all_text_parts = []
@@ -91,6 +97,7 @@ def chunk_recursive(pages: List[Dict], chunk_size: int = 500, overlap: int = 80)
     for page_num, text in all_text_parts:
         start = 0
         text_len = len(text)
+        page_prefix = f"[Page {page_num}] "
 
         while start < text_len:
             end = min(start + chunk_size, text_len)
@@ -101,10 +108,10 @@ def chunk_recursive(pages: List[Dict], chunk_size: int = 500, overlap: int = 80)
                 end = boundary if boundary > start else end
 
             chunk_text = text[start:end].strip()
-            if chunk_text:
+            if chunk_text and len(chunk_text) >= 50:
                 chunks.append({
                     "chunk_id": f"recur_{chunk_id}",
-                    "text": chunk_text,
+                    "text": page_prefix + chunk_text,
                     "page_num": page_num,
                     "strategy": "recursive",
                     "language": "unknown",
@@ -117,10 +124,11 @@ def chunk_recursive(pages: List[Dict], chunk_size: int = 500, overlap: int = 80)
     return chunks
 
 
-def chunk_with_overlap(pages: List[Dict], chunk_size: int = 400, overlap: int = 100) -> List[Dict]:
+def chunk_with_overlap(pages: List[Dict], chunk_size: int = 600, overlap: int = 150) -> List[Dict]:
     """
     Strategy 3: Sliding window with overlap, page-aware.
     Ensures context continuity across chunk boundaries.
+    Each chunk is prefixed with page context.
     """
     chunks = []
     chunk_id = 0
@@ -134,6 +142,8 @@ def chunk_with_overlap(pages: List[Dict], chunk_size: int = 400, overlap: int = 
         if not words:
             continue
 
+        page_prefix = f"[Page {page['page_num']}] "
+
         # Approximate word-based chunking (more language-agnostic)
         words_per_chunk = chunk_size // 5  # ~5 chars/word avg
         overlap_words = overlap // 5
@@ -142,10 +152,10 @@ def chunk_with_overlap(pages: List[Dict], chunk_size: int = 400, overlap: int = 
         while start < len(words):
             end = min(start + words_per_chunk, len(words))
             chunk_text = " ".join(words[start:end]).strip()
-            if chunk_text:
+            if chunk_text and len(chunk_text) >= 50:
                 chunks.append({
                     "chunk_id": f"overlap_{chunk_id}",
-                    "text": chunk_text,
+                    "text": page_prefix + chunk_text,
                     "page_num": page["page_num"],
                     "strategy": "overlap",
                     "language": page.get("language_detected", "unknown"),
@@ -183,16 +193,44 @@ def _find_sentence_boundary(text: str, start: int, end: int) -> int:
     return end
 
 
-def merge_and_dedupe(all_chunks: List[Dict]) -> List[Dict]:
-    """Remove duplicate chunks (same text, different strategy)."""
-    seen = set()
+def _trigrams(text: str) -> set:
+    """Generate character trigrams from text for fuzzy comparison."""
+    text = text.strip().lower()
+    if len(text) < 3:
+        return {text}
+    return {text[i:i+3] for i in range(len(text) - 2)}
+
+
+def _jaccard_similarity(set_a: set, set_b: set) -> float:
+    """Compute Jaccard similarity between two sets."""
+    if not set_a or not set_b:
+        return 0.0
+    intersection = len(set_a & set_b)
+    union = len(set_a | set_b)
+    return intersection / union if union > 0 else 0.0
+
+
+def merge_and_dedupe(all_chunks: List[Dict], similarity_threshold: float = 0.6) -> List[Dict]:
+    """
+    Remove duplicate and near-duplicate chunks using trigram Jaccard similarity.
+    This catches sliding-window near-duplicates that differ by only a few characters,
+    which the old first-200-chars approach missed entirely.
+    """
     unique = []
+    unique_trigrams = []
+
     for c in all_chunks:
-        key = c["text"].strip()[:200]
-        if key not in seen:
-            seen.add(key)
+        c_trigrams = _trigrams(c["text"])
+        is_dup = False
+        for existing_trigrams in unique_trigrams:
+            if _jaccard_similarity(c_trigrams, existing_trigrams) > similarity_threshold:
+                is_dup = True
+                break
+        if not is_dup:
             unique.append(c)
-    logger.info(f"After deduplication: {len(unique)} unique chunks")
+            unique_trigrams.append(c_trigrams)
+
+    logger.info(f"After deduplication: {len(all_chunks)} → {len(unique)} unique chunks (threshold={similarity_threshold})")
     return unique
 
 
@@ -270,10 +308,13 @@ def retrieve_chunks(
     query: str,
     top_k: int = 5,
     persist_dir: str = CHROMA_DIR,
+    max_per_page: int = 2,
 ) -> List[Dict]:
     """
     Retrieve top-k relevant chunks for a query using semantic similarity.
-    Also supports keyword fallback if semantic results are poor.
+    Applies page-level diversity: at most `max_per_page` chunks from any
+    single page, to prevent results being dominated by one page.
+    Over-fetches (3x top_k) then filters for diversity.
     """
     model = get_embedding_model()
     collection = get_chroma_collection(persist_dir)
@@ -283,20 +324,23 @@ def retrieve_chunks(
         logger.warning("ChromaDB collection is empty. Run ingestion first.")
         return []
 
+    # Over-fetch to allow diversity filtering
+    fetch_k = min(top_k * 3, count)
     query_embedding = model.encode([query]).tolist()
     results = collection.query(
         query_embeddings=query_embedding,
-        n_results=min(top_k, count),
+        n_results=fetch_k,
         include=["documents", "metadatas", "distances"],
     )
 
-    chunks = []
+    # Build candidate list
+    candidates = []
     for doc, meta, dist in zip(
         results["documents"][0],
         results["metadatas"][0],
         results["distances"][0],
     ):
-        chunks.append({
+        candidates.append({
             "text": doc,
             "page_num": meta.get("page_num", "?"),
             "strategy": meta.get("strategy", "?"),
@@ -304,7 +348,27 @@ def retrieve_chunks(
             "score": round(1 - dist, 4),  # cosine similarity
         })
 
-    return chunks
+    # Apply page-level diversity: max N chunks per page
+    page_counts = {}
+    diverse_chunks = []
+    for chunk in candidates:
+        pg = chunk["page_num"]
+        page_counts[pg] = page_counts.get(pg, 0) + 1
+        if page_counts[pg] <= max_per_page:
+            diverse_chunks.append(chunk)
+            if len(diverse_chunks) >= top_k:
+                break
+
+    # If diversity filtering gave too few results, fill from remaining
+    if len(diverse_chunks) < top_k:
+        for chunk in candidates:
+            if chunk not in diverse_chunks:
+                diverse_chunks.append(chunk)
+                if len(diverse_chunks) >= top_k:
+                    break
+
+    logger.info(f"Retrieved {len(diverse_chunks)} diverse chunks (from {len(set(c['page_num'] for c in diverse_chunks))} pages)")
+    return diverse_chunks
 
 
 def keyword_search(
