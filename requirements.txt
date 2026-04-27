@@ -1,0 +1,26 @@
+# Core PDF & OCR
+PyMuPDF>=1.23.0
+pdfplumber>=0.10.0
+pytesseract>=0.3.10
+easyocr>=1.7.0
+Pillow>=10.0.0
+
+# LangChain & Vector Store
+langchain>=0.1.0
+langchain-community>=0.0.20
+chromadb>=0.4.22
+
+# Embeddings
+sentence-transformers>=2.3.0
+
+# LLM — Groq API only
+groq>=0.5.0
+
+# UI
+gradio>=4.15.0
+
+# Utilities
+langdetect>=1.0.9
+tqdm>=4.66.0
+python-dotenv>=1.0.0
+numpy>=1.24.0
